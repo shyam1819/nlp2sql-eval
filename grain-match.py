@@ -58,16 +58,36 @@ class SQLGrainVerdict(BaseModel):
     filters: _GrainScore
     aggregations: _GrainScore
     arithmetic: _GrainScore
-    intent: _GrainScore
+    intent: _GrainScore        # does it answer the user's question?
+    query_match: _GrainScore   # overall SQL match vs gold (semantic equivalence)
+
+
+# Rubrics for the two query-level dimensions (your original two metrics).
+INTENT_RUBRIC = [
+    Rubric(score_range=(0, 2),  expected_outcome="Answers a different question than asked."),
+    Rubric(score_range=(3, 6),  expected_outcome="Addresses the question but misses part of the intent."),
+    Rubric(score_range=(7, 9),  expected_outcome="Answers the intent with a minor gap."),
+    Rubric(score_range=(10, 10),expected_outcome="Fully answers the user's analytical intent."),
+]
+QUERY_MATCH_RUBRIC = [
+    Rubric(score_range=(0, 2),  expected_outcome="Would return a different result set than gold."),
+    Rubric(score_range=(3, 6),  expected_outcome="Partially overlapping results; notable differences."),
+    Rubric(score_range=(7, 9),  expected_outcome="Same results except a minor edge case."),
+    Rubric(score_range=(10, 10),expected_outcome="Semantically equivalent to gold for any data state."),
+]
+
+
+def _bands_from(rubrics: List[Rubric]) -> str:
+    out = []
+    for r in rubrics:
+        lo, hi = r.score_range
+        rng = f"{lo}" if lo == hi else f"{lo}-{hi}"
+        out.append(f"{rng}={r.expected_outcome}")
+    return "; ".join(out)
 
 
 def _render_bands(grain: str) -> str:
-    bands = []
-    for r in GRAIN_RUBRICS[grain]:
-        lo, hi = r.score_range
-        rng = f"{lo}" if lo == hi else f"{lo}-{hi}"
-        bands.append(f"{rng}={r.expected_outcome}")
-    return "; ".join(bands)
+    return _bands_from(GRAIN_RUBRICS[grain])
 
 
 def _build_prompt(question: str, gold: str, pred: str, schema: Optional[str]) -> str:
@@ -77,8 +97,8 @@ def _build_prompt(question: str, gold: str, pred: str, schema: Optional[str]) ->
     )
     schema_block = f"\n[SCHEMA]\n{schema}\n" if schema else ""
     return f"""You are a strict SQL evaluator. Compare a PREDICTED query against a GOLD \
-reference, grain by grain. For each grain, assign a score 0-10 using THAT grain's \
-own scoring bands below, and give a one-sentence reason. Base each score on the \
+reference. Score the structural grains AND two query-level dimensions, each 0-10 \
+using its own scoring bands, with a one-sentence reason. Base grain scores on the \
 PROPORTION of that grain's elements that are correct. Judge SEMANTICS, not syntax: \
 do not penalize equivalent rewrites, alias/CTE renaming, predicate reordering, or \
 column order.
@@ -94,20 +114,37 @@ column order.
 
 Score these grains, each against its own bands:
 {grain_lines}
-- intent: score 0-10 whether the predicted query answers the user's actual question.
 
-Return your verdict for every grain."""
+Then score these two query-level dimensions:
+- intent: does the predicted query answer the user's actual question?
+    bands -> {_bands_from(INTENT_RUBRIC)}
+- query_match: overall, would the predicted query match the gold's result?
+    bands -> {_bands_from(QUERY_MATCH_RUBRIC)}
+
+Return your verdict for every grain and both query-level dimensions."""
 
 
 class SQLGrainJudge(BaseMetric):
-    """One LLM call -> per-grain scores + aggregate. `judge` is a DeepEvalBaseLLM
-    (e.g. GPTModel(temperature=0)). Exposes .grain_scores after measure()."""
+    """One LLM call -> 7 grain scores + intent + query_match, combined into a
+    configurable composite. `judge` is a DeepEvalBaseLLM (e.g. GPTModel(temperature=0)).
+
+    After measure(), exposes:
+      .grain_scores (dict), .grain_aggregate, .intent_score,
+      .query_match_score, and .score (the composite).
+
+    component_weights blends the three groups into the headline score, e.g.
+    {"grains": 0.5, "intent": 0.2, "query_match": 0.3}.
+    """
+
+    DEFAULT_COMPONENT_WEIGHTS = {"grains": 0.5, "intent": 0.2, "query_match": 0.3}
 
     def __init__(self, judge, threshold: float = 0.8,
-                 weights: dict = DEFAULT_WEIGHTS, schema: Optional[str] = None):
+                 weights: dict = DEFAULT_WEIGHTS, schema: Optional[str] = None,
+                 component_weights: Optional[dict] = None):
         self.judge = judge
         self.threshold = threshold
-        self.weights = weights
+        self.weights = weights                                   # within-grain weights
+        self.component_weights = component_weights or self.DEFAULT_COMPONENT_WEIGHTS
         self.schema = schema
         self.async_mode = False
         self.include_reason = True
@@ -116,7 +153,9 @@ class SQLGrainJudge(BaseMetric):
         self.reason = None
         self.success = False
         self.grain_scores: Dict[str, float] = {}
+        self.grain_aggregate: float = 0.0
         self.intent_score: float = 0.0
+        self.query_match_score: float = 0.0
 
     def _consume(self, verdict) -> float:
         # verdict may be a pydantic obj (structured output) or a JSON string
@@ -125,14 +164,30 @@ class SQLGrainJudge(BaseMetric):
             verdict = SQLGrainVerdict(**json.loads(re.sub(r"```(json)?", "", verdict).strip()))
         self.grain_scores = {g: getattr(verdict, g).score / 10.0 for g in GRAINS}
         self.intent_score = verdict.intent.score / 10.0
-        tot = sum(self.weights.get(g, 0) for g in GRAINS)
-        self.score = sum(self.grain_scores[g] * self.weights.get(g, 0) for g in GRAINS) / tot if tot else 0.0
+        self.query_match_score = verdict.query_match.score / 10.0
+
+        gtot = sum(self.weights.get(g, 0) for g in GRAINS)
+        self.grain_aggregate = (
+            sum(self.grain_scores[g] * self.weights.get(g, 0) for g in GRAINS) / gtot
+            if gtot else 0.0
+        )
+
+        cw = self.component_weights
+        parts_w = {"grains": self.grain_aggregate,
+                   "intent": self.intent_score,
+                   "query_match": self.query_match_score}
+        ctot = sum(cw.get(k, 0) for k in parts_w)
+        self.score = (sum(parts_w[k] * cw.get(k, 0) for k in parts_w) / ctot
+                      if ctot else 0.0)
+
         if self.include_reason:
             parts = []
             for g in GRAINS:
                 tag = "OK " if self.grain_scores[g] >= 0.9 else "!! "
                 parts.append(f"{tag}{g}={self.grain_scores[g]:.1f} ({getattr(verdict, g).reason})")
+            parts.append(f"[grain_agg={self.grain_aggregate:.2f}]")
             parts.append(f"intent={self.intent_score:.1f} ({verdict.intent.reason})")
+            parts.append(f"query_match={self.query_match_score:.1f} ({verdict.query_match.reason})")
             self.reason = " | ".join(parts)
         self.success = self.score >= self.threshold
         return self.score
@@ -238,3 +293,43 @@ def grain_geval(grain: str, threshold: float = 0.8, judge=None,
 
 def make_grain_gevals(grains=GRAINS, threshold: float = 0.8, judge=None) -> List[GEval]:
     return [grain_geval(g, threshold, judge) for g in grains]
+
+
+def intent_geval(threshold: float = 0.7, judge=None) -> GEval:
+    """Query-level: does the SQL answer the user's question? (your original 'intent match')"""
+    return GEval(
+        name="Intent Match",
+        evaluation_steps=[
+            "Infer the user's analytical intent from 'input'.",
+            "Judge whether 'actual output' answers that intent, using 'expected output' as reference.",
+            "Penalize wrong grain, missing filters, or answering a different question.",
+        ],
+        evaluation_params=[P.INPUT, P.ACTUAL_OUTPUT, P.EXPECTED_OUTPUT],
+        rubric=INTENT_RUBRIC,
+        threshold=threshold,
+        model=judge,
+    )
+
+
+def query_match_geval(threshold: float = 0.8, judge=None) -> GEval:
+    """Query-level: would predicted SQL match gold's result? (your original 'SQL match')"""
+    return GEval(
+        name="Query Match",
+        evaluation_steps=[
+            "Treat 'actual output' and 'expected output' as SQL queries.",
+            "Judge whether they would return the same result set for any valid data state.",
+            "Account for equivalent rewrites; penalize INNER vs LEFT, missing DISTINCT, different grain.",
+        ],
+        evaluation_params=[P.ACTUAL_OUTPUT, P.EXPECTED_OUTPUT],
+        rubric=QUERY_MATCH_RUBRIC,
+        threshold=threshold,
+        model=judge,
+    )
+
+
+def make_full_grain_metrics(grains=GRAINS, threshold: float = 0.8,
+                            judge=None) -> List[GEval]:
+    """All grain GEvals PLUS intent match and query match — the complete set as
+    separate report rows."""
+    return (make_grain_gevals(grains, threshold, judge)
+            + [intent_geval(threshold, judge), query_match_geval(threshold, judge)])
